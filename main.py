@@ -137,10 +137,7 @@ def dashboard() -> HTMLResponse:
     ).fetchone()[0]
     settings = dict(cursor.execute("SELECT key, value FROM settings").fetchall())
 
-  html = (
-      BASE_TEMPLATE
-      + """
-    {% block content %}
+  content_template = """
     <div class="row mb-4">
         <div class="col-12">
             <div class="p-5 mb-4 bg-white rounded-3 shadow-sm border">
@@ -190,10 +187,12 @@ def dashboard() -> HTMLResponse:
             </div>
         </div>
     </div>
-    {% endblock %}
     """
-  )
 
+  html = BASE_TEMPLATE.replace(
+      "{% block content %}{% endblock %}",
+      f"{{% block content %}} {content_template} {{% endblock %}}",
+  )
   rendered = Template(html).render(
       company_name=settings.get("company_name", "Acme Corp"),
       theme_color=settings.get("theme_color", "#0d6efd"),
@@ -212,10 +211,7 @@ def builder_get() -> HTMLResponse:
     cursor = conn.cursor()
     settings = dict(cursor.execute("SELECT key, value FROM settings").fetchall())
 
-  html = (
-      BASE_TEMPLATE
-      + """
-    {% block content %}
+  content_template = """
     <div class="row">
         <div class="col-md-5">
             <div class="card shadow-sm border-0 p-4">
@@ -248,8 +244,10 @@ def builder_get() -> HTMLResponse:
             </div>
         </div>
     </div>
-    {% endblock %}
     """
+  html = BASE_TEMPLATE.replace(
+      "{% block content %}{% endblock %}",
+      f"{{% block content %}} {content_template} {{% endblock %}}",
   )
   rendered = Template(html).render(
       company_name=settings.get("company_name", "Acme Corp"),
@@ -287,10 +285,7 @@ def crm_get() -> HTMLResponse:
     leads = cursor.execute("SELECT id, name, email, status FROM leads").fetchall()
     settings = dict(cursor.execute("SELECT key, value FROM settings").fetchall())
 
-  html = (
-      BASE_TEMPLATE
-      + """
-    {% block content %}
+  content_template = """
     <div class="row">
         <div class="col-md-4">
             <div class="card shadow-sm border-0 p-4">
@@ -344,8 +339,10 @@ def crm_get() -> HTMLResponse:
             </div>
         </div>
     </div>
-    {% endblock %}
     """
+  html = BASE_TEMPLATE.replace(
+      "{% block content %}{% endblock %}",
+      f"{{% block content %}} {content_template} {{% endblock %}}",
   )
   rendered = Template(html).render(
       company_name=settings.get("company_name", "Acme Corp"),
@@ -378,10 +375,7 @@ def marketing_get() -> HTMLResponse:
     ).fetchall()
     settings = dict(cursor.execute("SELECT key, value FROM settings").fetchall())
 
-  html = (
-      BASE_TEMPLATE
-      + """
-    {% block content %}
+  content_template = """
     <div class="row">
         <div class="col-md-4">
             <div class="card shadow-sm border-0 p-4">
@@ -433,8 +427,10 @@ def marketing_get() -> HTMLResponse:
             </div>
         </div>
     </div>
-    {% endblock %}
     """
+  html = BASE_TEMPLATE.replace(
+      "{% block content %}{% endblock %}",
+      f"{{% block content %}} {content_template} {{% endblock %}}",
   )
   rendered = Template(html).render(
       company_name=settings.get("company_name", "Acme Corp"),
@@ -467,10 +463,7 @@ def webinars_get() -> HTMLResponse:
     ).fetchall()
     settings = dict(cursor.execute("SELECT key, value FROM settings").fetchall())
 
-  html = (
-      BASE_TEMPLATE
-      + """
-    {% block content %}
+  content_template = """
     <div class="row">
         <div class="col-md-4">
             <div class="card shadow-sm border-0 p-4">
@@ -520,8 +513,10 @@ def webinars_get() -> HTMLResponse:
             </div>
         </div>
     </div>
-    {% endblock %}
     """
+  html = BASE_TEMPLATE.replace(
+      "{% block content %}{% endblock %}",
+      f"{{% block content %}} {content_template} {{% endblock %}}",
   )
   rendered = Template(html).render(
       company_name=settings.get("company_name", "Acme Corp"),
@@ -556,10 +551,7 @@ def subscriptions_get(
     cursor = conn.cursor()
     settings = dict(cursor.execute("SELECT key, value FROM settings").fetchall())
 
-  html = (
-      BASE_TEMPLATE
-      + """
-    {% block content %}
+  content_template = """
     <div class="row">
         <div class="col-md-5">
             <div class="card shadow-sm border-0 p-4">
@@ -603,8 +595,10 @@ def subscriptions_get(
             </div>
         </div>
     </div>
-    {% endblock %}
     """
+  html = BASE_TEMPLATE.replace(
+      "{% block content %}{% endblock %}",
+      f"{{% block content %}} {content_template} {{% endblock %}}",
   )
   rendered = Template(html).render(
       company_name=settings.get("company_name", "Acme Corp"),
@@ -637,10 +631,7 @@ def workflow_get() -> HTMLResponse:
     ).fetchall()
     settings = dict(cursor.execute("SELECT key, value FROM settings").fetchall())
 
-  html = (
-      BASE_TEMPLATE
-      + """
-    {% block content %}
+  content_template = """
     <div class="row">
         <div class="col-md-5">
             <div class="card shadow-sm border-0 p-4">
@@ -707,8 +698,10 @@ def workflow_get() -> HTMLResponse:
             </div>
         </div>
     </div>
-    {% endblock %}
     """
+  html = BASE_TEMPLATE.replace(
+      "{% block content %}{% endblock %}",
+      f"{{% block content %}} {content_template} {{% endblock %}}",
   )
   rendered = Template(html).render(
       company_name=settings.get("company_name", "Acme Corp"),
