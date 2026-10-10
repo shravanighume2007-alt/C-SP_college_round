@@ -1,14 +1,5 @@
 from __future__ import annotations
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
 
-app = FastAPI()
-
-@app.get("/", response_class=HTMLResponse)
-def read_root():
-    # This reads your index.html file and displays it on your website URL
-    with open("index.html", "r", encoding="utf-8") as f:
-        return f.read()
 """BLACKOUT backend: FastAPI + deterministic rule-based agent + JSON persistence.
 
 Run:  uvicorn main:app --reload --port 8000
@@ -27,6 +18,7 @@ from typing import Any, Dict, List, Literal, Optional, Set
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -489,6 +481,10 @@ def dashboard_payload(db: Dict[str, Any]) -> Dict[str, Any]:
 # --------------------------------------------------------------------------- #
 
 app = FastAPI(title="BLACKOUT API", version="1.0.0")
+@app.get("/", response_class=HTMLResponse)
+def read_root():
+    with open("index.html", "r", encoding="utf-8") as f:
+        return f.read()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
