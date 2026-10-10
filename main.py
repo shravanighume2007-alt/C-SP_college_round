@@ -1,3 +1,13 @@
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
+
+app = FastAPI()
+
+@app.get("/", response_class=HTMLResponse)
+def read_root():
+    # This reads your index.html file and displays it on your website URL
+    with open("index.html", "r", encoding="utf-8") as f:
+        return f.read()
 """BLACKOUT backend: FastAPI + deterministic rule-based agent + JSON persistence.
 
 Run:  uvicorn main:app --reload --port 8000
