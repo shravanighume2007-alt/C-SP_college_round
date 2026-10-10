@@ -70,6 +70,9 @@ def init_db():
     conn.commit()
 
 
+# Initialize database immediately on startup (fixes Gunicorn / production missing table bug)
+init_db()
+
 # HTML Template Layout with Bootstrap 5
 BASE_TEMPLATE = """
 <!DOCTYPE html>
@@ -619,7 +622,6 @@ def subscriptions_get(subscribers: int = 120, price: float = 29.0, churn: float 
 def subscriptions_post(
     subscribers: int = Form(...), price: float = Form(...), churn: float = Form(...)
 ):
-  # Redirect back with query parameters to retain values
   return RedirectResponse(
       url=f"/subscriptions?subscribers={subscribers}&price={price}&churn={churn}",
       status_code=status.HTTP_303_SEE_OTHER,
@@ -742,5 +744,4 @@ def workflow_post(
 
 
 if __name__ == "__main__":
-  init_db()
   uvicorn.run("main:app", host="127.0.0.1", port=5000, reload=True)
