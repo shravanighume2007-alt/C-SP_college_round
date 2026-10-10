@@ -1,3 +1,4 @@
+from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
@@ -13,7 +14,7 @@ def read_root():
 Run:  uvicorn main:app --reload --port 8000
 State is persisted to ``nexus_db.json`` in this directory (atomic writes).
 """
-from __future__ import annotations
+
 
 import json
 import os
