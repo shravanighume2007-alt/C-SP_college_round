@@ -1,5 +1,5 @@
 import sqlite3
-from fastapi import FastAPI, Form, Request, status
+from fastapi import FastAPI, Form, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 from jinja2 import Template
 import uvicorn
@@ -54,7 +54,6 @@ def init_db():
                 value TEXT
             )
         """)
-    # Default settings if not present
     cursor.execute(
         "INSERT OR IGNORE INTO settings (key, value) VALUES ('company_name',"
         " 'Acme Corp')"
@@ -70,10 +69,9 @@ def init_db():
     conn.commit()
 
 
-# Initialize database immediately on startup (fixes Gunicorn / production missing table bug)
+# Initialize database on startup
 init_db()
 
-# HTML Template Layout with Bootstrap 5
 BASE_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -122,7 +120,7 @@ BASE_TEMPLATE = """
 
 
 @app.get("/", response_class=HTMLResponse)
-def dashboard():
+def dashboard() -> HTMLResponse:
   with sqlite3.connect(DB_NAME) as conn:
     cursor = conn.cursor()
     leads_count = cursor.execute(
@@ -149,7 +147,7 @@ def dashboard():
                 <h1 class="display-5 fw-bold text-primary">Business Overview</h1>
                 <p class="fs-4 text-muted">{{ slogan }}</p>
                 <hr class="my-4">
-                <p>Welcome to your centralized operations center. Manage leads, review campaigns, schedule webinars, and control AI workflows seamlessly using FastAPI.</p>
+                <p>Welcome to your centralized operations center. Manage leads, review campaigns, schedule webinars, and control AI workflows seamlessly.</p>
             </div>
         </div>
     </div>
@@ -197,9 +195,9 @@ def dashboard():
   )
 
   rendered = Template(html).render(
-      company_name=settings["company_name"],
-      theme_color=settings["theme_color"],
-      slogan=settings["slogan"],
+      company_name=settings.get("company_name", "Acme Corp"),
+      theme_color=settings.get("theme_color", "#0d6efd"),
+      slogan=settings.get("slogan", ""),
       leads_count=leads_count,
       campaigns_count=campaigns_count,
       webinars_count=webinars_count,
@@ -209,7 +207,7 @@ def dashboard():
 
 
 @app.get("/builder", response_class=HTMLResponse)
-def builder_get():
+def builder_get() -> HTMLResponse:
   with sqlite3.connect(DB_NAME) as conn:
     cursor = conn.cursor()
     settings = dict(cursor.execute("SELECT key, value FROM settings").fetchall())
@@ -254,9 +252,9 @@ def builder_get():
     """
   )
   rendered = Template(html).render(
-      company_name=settings["company_name"],
-      theme_color=settings["theme_color"],
-      slogan=settings["slogan"],
+      company_name=settings.get("company_name", "Acme Corp"),
+      theme_color=settings.get("theme_color", "#0d6efd"),
+      slogan=settings.get("slogan", ""),
   )
   return HTMLResponse(content=rendered)
 
@@ -266,7 +264,7 @@ def builder_post(
     company_name: str = Form(...),
     slogan: str = Form(...),
     theme_color: str = Form(...),
-):
+) -> RedirectResponse:
   with sqlite3.connect(DB_NAME) as conn:
     cursor = conn.cursor()
     cursor.execute(
@@ -283,7 +281,7 @@ def builder_post(
 
 
 @app.get("/crm", response_class=HTMLResponse)
-def crm_get():
+def crm_get() -> HTMLResponse:
   with sqlite3.connect(DB_NAME) as conn:
     cursor = conn.cursor()
     leads = cursor.execute("SELECT id, name, email, status FROM leads").fetchall()
@@ -350,8 +348,8 @@ def crm_get():
     """
   )
   rendered = Template(html).render(
-      company_name=settings["company_name"],
-      theme_color=settings["theme_color"],
+      company_name=settings.get("company_name", "Acme Corp"),
+      theme_color=settings.get("theme_color", "#0d6efd"),
       leads=leads,
   )
   return HTMLResponse(content=rendered)
@@ -360,7 +358,7 @@ def crm_get():
 @app.post("/crm", response_class=HTMLResponse)
 def crm_post(
     name: str = Form(...), email: str = Form(...), status: str = Form(...)
-):
+) -> RedirectResponse:
   with sqlite3.connect(DB_NAME) as conn:
     cursor = conn.cursor()
     cursor.execute(
@@ -372,7 +370,7 @@ def crm_post(
 
 
 @app.get("/marketing", response_class=HTMLResponse)
-def marketing_get():
+def marketing_get() -> HTMLResponse:
   with sqlite3.connect(DB_NAME) as conn:
     cursor = conn.cursor()
     campaigns = cursor.execute(
@@ -439,8 +437,8 @@ def marketing_get():
     """
   )
   rendered = Template(html).render(
-      company_name=settings["company_name"],
-      theme_color=settings["theme_color"],
+      company_name=settings.get("company_name", "Acme Corp"),
+      theme_color=settings.get("theme_color", "#0d6efd"),
       campaigns=campaigns,
   )
   return HTMLResponse(content=rendered)
@@ -449,7 +447,7 @@ def marketing_get():
 @app.post("/marketing", response_class=HTMLResponse)
 def marketing_post(
     title: str = Form(...), channel: str = Form(...), budget: float = Form(...)
-):
+) -> RedirectResponse:
   with sqlite3.connect(DB_NAME) as conn:
     cursor = conn.cursor()
     cursor.execute(
@@ -461,7 +459,7 @@ def marketing_post(
 
 
 @app.get("/webinars", response_class=HTMLResponse)
-def webinars_get():
+def webinars_get() -> HTMLResponse:
   with sqlite3.connect(DB_NAME) as conn:
     cursor = conn.cursor()
     webinars_list = cursor.execute(
@@ -526,8 +524,8 @@ def webinars_get():
     """
   )
   rendered = Template(html).render(
-      company_name=settings["company_name"],
-      theme_color=settings["theme_color"],
+      company_name=settings.get("company_name", "Acme Corp"),
+      theme_color=settings.get("theme_color", "#0d6efd"),
       webinars_list=webinars_list,
   )
   return HTMLResponse(content=rendered)
@@ -536,7 +534,7 @@ def webinars_get():
 @app.post("/webinars", response_class=HTMLResponse)
 def webinars_post(
     title: str = Form(...), speaker: str = Form(...), date: str = Form(...)
-):
+) -> RedirectResponse:
   with sqlite3.connect(DB_NAME) as conn:
     cursor = conn.cursor()
     cursor.execute(
@@ -548,7 +546,9 @@ def webinars_post(
 
 
 @app.get("/subscriptions", response_class=HTMLResponse)
-def subscriptions_get(subscribers: int = 120, price: float = 29.0, churn: float = 5.0):
+def subscriptions_get(
+    subscribers: int = 120, price: float = 29.0, churn: float = 5.0
+) -> HTMLResponse:
   mrr = subscribers * price
   arr = mrr * 12
 
@@ -607,8 +607,8 @@ def subscriptions_get(subscribers: int = 120, price: float = 29.0, churn: float 
     """
   )
   rendered = Template(html).render(
-      company_name=settings["company_name"],
-      theme_color=settings["theme_color"],
+      company_name=settings.get("company_name", "Acme Corp"),
+      theme_color=settings.get("theme_color", "#0d6efd"),
       subscribers=subscribers,
       price=price,
       churn=churn,
@@ -621,7 +621,7 @@ def subscriptions_get(subscribers: int = 120, price: float = 29.0, churn: float 
 @app.post("/subscriptions", response_class=HTMLResponse)
 def subscriptions_post(
     subscribers: int = Form(...), price: float = Form(...), churn: float = Form(...)
-):
+) -> RedirectResponse:
   return RedirectResponse(
       url=f"/subscriptions?subscribers={subscribers}&price={price}&churn={churn}",
       status_code=status.HTTP_303_SEE_OTHER,
@@ -629,7 +629,7 @@ def subscriptions_post(
 
 
 @app.get("/workflow", response_class=HTMLResponse)
-def workflow_get():
+def workflow_get() -> HTMLResponse:
   with sqlite3.connect(DB_NAME) as conn:
     cursor = conn.cursor()
     workflows = cursor.execute(
@@ -711,8 +711,8 @@ def workflow_get():
     """
   )
   rendered = Template(html).render(
-      company_name=settings["company_name"],
-      theme_color=settings["theme_color"],
+      company_name=settings.get("company_name", "Acme Corp"),
+      theme_color=settings.get("theme_color", "#0d6efd"),
       workflows=workflows,
   )
   return HTMLResponse(content=rendered)
@@ -721,9 +721,9 @@ def workflow_get():
 @app.post("/workflow", response_class=HTMLResponse)
 def workflow_post(
     action: str = Form(...),
-    instruction: str = Form(None),
-    id: int = Form(None),
-):
+    instruction: str | None = Form(None),
+    id: int | None = Form(None),
+) -> RedirectResponse:
   with sqlite3.connect(DB_NAME) as conn:
     cursor = conn.cursor()
     if action == "add" and instruction:
