@@ -1,666 +1,746 @@
-from __future__ import annotations
+import sqlite3
+from fastapi import FastAPI, Form, Request, status
+from fastapi.responses import HTMLResponse, RedirectResponse
+from jinja2 import Template
+import uvicorn
 
-"""BLACKOUT backend: FastAPI + deterministic rule-based agent + JSON persistence.
+app = FastAPI(title="Business Suite Application")
+DB_NAME = "database.db"
 
-Run:  uvicorn main:app --reload --port 8000
-State is persisted to ``nexus_db.json`` in this directory (atomic writes).
+
+def init_db():
+  with sqlite3.connect(DB_NAME) as conn:
+    cursor = conn.cursor()
+    # CRM Leads
+    cursor.execute("""
+            CREATE TABLE IF NOT EXISTS leads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                email TEXT NOT NULL,
+                status TEXT DEFAULT 'New'
+            )
+        """)
+    # Marketing Campaigns
+    cursor.execute("""
+            CREATE TABLE IF NOT EXISTS campaigns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                budget REAL NOT NULL,
+                status TEXT DEFAULT 'Active'
+            )
+        """)
+    # Webinars
+    cursor.execute("""
+            CREATE TABLE IF NOT EXISTS webinars (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                speaker TEXT NOT NULL,
+                date TEXT NOT NULL
+            )
+        """)
+    # AI Workflow Requests
+    cursor.execute("""
+            CREATE TABLE IF NOT EXISTS workflows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                instruction TEXT NOT NULL,
+                status TEXT DEFAULT 'Pending Approval'
+            )
+        """)
+    # Website Settings
+    cursor.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+    # Default settings if not present
+    cursor.execute(
+        "INSERT OR IGNORE INTO settings (key, value) VALUES ('company_name',"
+        " 'Acme Corp')"
+    )
+    cursor.execute(
+        "INSERT OR IGNORE INTO settings (key, value) VALUES ('theme_color',"
+        " '#0d6efd')"
+    )
+    cursor.execute(
+        "INSERT OR IGNORE INTO settings (key, value) VALUES ('slogan',"
+        " 'Empowering your business growth')"
+    )
+    conn.commit()
+
+
+# HTML Template Layout with Bootstrap 5
+BASE_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ company_name }} - Business Suite</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        :root { --primary-color: {{ theme_color }}; }
+        .bg-primary { background-color: var(--primary-color) !important; }
+        .text-primary { color: var(--primary-color) !important; }
+        .btn-primary { background-color: var(--primary-color); border-color: var(--primary-color); }
+        .btn-primary:hover { opacity: 0.9; background-color: var(--primary-color); border-color: var(--primary-color); }
+    </style>
+</head>
+<body class="bg-light">
+    <nav class="navbar navbar-expand-lg navbar-dark bg-primary shadow-sm">
+        <div class="container-fluid">
+            <a class="navbar-brand fw-bold" href="/">🚀 {{ company_name }}</a>
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+            <div class="collapse navbar-collapse" id="navbarNav">
+                <ul class="navbar-nav ms-auto">
+                    <li class="nav-item"><a class="nav-link" href="/">Dashboard</a></li>
+                    <li class="nav-item"><a class="nav-link" href="/builder">Website Builder</a></li>
+                    <li class="nav-item"><a class="nav-link" href="/crm">CRM</a></li>
+                    <li class="nav-item"><a class="nav-link" href="/marketing">Marketing</a></li>
+                    <li class="nav-item"><a class="nav-link" href="/webinars">Webinars</a></li>
+                    <li class="nav-item"><a class="nav-link" href="/subscriptions">Subscriptions</a></li>
+                    <li class="nav-item"><a class="nav-link" href="/workflow">AI Workflow</a></li>
+                </ul>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container my-4">
+        {% block content %}{% endblock %}
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
 """
 
 
-import json
-import os
-import re
-import tempfile
-import threading
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Set
-from uuid import uuid4
-
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-
-DB_PATH = Path(__file__).resolve().parent / "nexus_db.json"
-DB_LOCK = threading.RLock()
-
-ModuleName = Literal["website", "crm", "marketing", "billing", "approval"]
-
-# --------------------------------------------------------------------------- #
-# Pydantic models
-# --------------------------------------------------------------------------- #
-
-
-class ParseRequest(BaseModel):
-    prompt: str = Field(..., min_length=3, max_length=1000)
-
-
-class WebsiteSpec(BaseModel):
-    slug: str
-    title: str
-    headline: str
-    subheadline: str
-    sections: List[str]
-    theme: str = "tokyo-nights"
-
-
-class SegmentSpec(BaseModel):
-    name: str
-    criteria: str
-    threshold: float
-    lead_ids: List[str]
-    lead_count: int
-    total_value: float
-
-
-class BillingSpec(BaseModel):
-    plan_name: str
-    price: float
-    interval_days: int
-    currency: str = "USD"
-    subscriber_ids: List[str]
-    projected_mrr: float
-
-
-class CampaignSpec(BaseModel):
-    name: str
-    channel: str
-    audience_size: int
-    scheduled_for: str
-
-
-class Entities(BaseModel):
-    topic: str
-    website: Optional[WebsiteSpec] = None
-    segment: Optional[SegmentSpec] = None
-    billing: Optional[BillingSpec] = None
-    campaign: Optional[CampaignSpec] = None
-
-
-class PlanStep(BaseModel):
-    id: str
-    module: ModuleName
-    title: str
-    detail: str
-    duration_ms: int
-    requires_approval: bool = False
-    logs: List[str] = Field(default_factory=list)
-    chips: List[str] = Field(default_factory=list)
-
-
-class ApprovalSpec(BaseModel):
-    title: str
-    message: str
-    sensitive_actions: List[str]
-    impact: Dict[str, float]
-
-
-class ExecutionPlan(BaseModel):
-    plan_id: str
-    prompt: str
-    summary: str
-    steps: List[PlanStep]
-    entities: Entities
-    approval: ApprovalSpec
-    created_at: str
-
-
-class ExecutedStep(PlanStep):
-    status: Literal["completed"] = "completed"
-    started_at: str
-    completed_at: str
-
-
-class ApproveRequest(BaseModel):
-    prompt: str = Field(..., min_length=3, max_length=1000)
-    plan: ExecutionPlan
-    approved_by: str = "operator"
-
-
-class ApproveResponse(BaseModel):
-    status: Literal["committed", "already_committed"]
-    workflow_id: str
-    request_id: str
-    committed_at: str
-    summary: Dict[str, Any]
-    executed_steps: List[ExecutedStep]
-
-
-# --------------------------------------------------------------------------- #
-# Persistence helpers
-# --------------------------------------------------------------------------- #
-
-
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def iso(dt: datetime, precision: str = "seconds") -> str:
-    return dt.isoformat(timespec=precision).replace("+00:00", "Z")
-
-
-def read_db() -> Dict[str, Any]:
-    try:
-        with DB_PATH.open("r", encoding="utf-8") as fh:
-            return json.load(fh)
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=500, detail="nexus_db.json not found in backend root") from exc
-    except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=500, detail=f"nexus_db.json is corrupted: {exc}") from exc
-
-
-def write_db(db: Dict[str, Any]) -> None:
-    """Atomic write: temp file in the same directory, fsync, then os.replace."""
-    fd, tmp_path = tempfile.mkstemp(dir=str(DB_PATH.parent), prefix=".nexus_db.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(db, fh, indent=2, ensure_ascii=False)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp_path, DB_PATH)
-    except Exception:
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-        raise
-
-
-# --------------------------------------------------------------------------- #
-# Deterministic rule-based agent
-# --------------------------------------------------------------------------- #
-
-INTENTS: Dict[str, "re.Pattern[str]"] = {
-    "website": re.compile(r"\b(website|web site|site|landing|page|promo|microsite)\b"),
-    "crm": re.compile(r"\b(crm|leads?|segment|filter|customers?|prospects?|contacts?)\b"),
-    "marketing": re.compile(
-        r"\b(emails?|campaigns?|newsletter|announce|announcement|outreach|blast|promote|marketing)\b"
-    ),
-    "billing": re.compile(
-        r"\b(billing|subscriptions?|recurring|invoice|plan|payments?|pricing|charge)\b"
-    ),
-}
-BILLING_CLAUSE = INTENTS["billing"]
-HIGH_VALUE_RE = re.compile(r"high[\s-]?value|top\s+leads?|\bvip\b|premium\s+leads?|big\s+spenders?")
-THRESHOLD_RE = re.compile(
-    r"(?:over|above|more than|greater than|exceeding|at least|>=?)\s*\$?\s*(\d[\d,]*(?:\.\d+)?)\s*(k|m)?",
-    re.IGNORECASE,
-)
-TOPIC_RE = re.compile(
-    r"\b(?:for|about|promoting|promote)\s+(?:our|the|my|a|an)?\s*(?:upcoming|new|latest|next)?\s*"
-    r"([a-z0-9&\- ]{1,40}?)\s+(webinar|event|launch|workshop|product|masterclass|conference)\b",
-    re.IGNORECASE,
-)
-PRICE_RE = re.compile(r"(?:[$€₹]\s?(\d[\d,]*(?:\.\d+)?))|(?:(\d[\d,]*(?:\.\d+)?)\s*(?:dollars|usd|bucks))", re.IGNORECASE)
-INTERVAL_RE = re.compile(r"(\d+)\s*-?\s*day", re.IGNORECASE)
-ACRONYMS = {"ai", "ml", "saas", "crm", "api", "ui", "ux", "b2b", "b2c"}
-EXCLUDED_STATUSES = {"Cold", "Lost", "Won"}
-DEFAULT_PRICE = 149.0
-HIGH_VALUE_THRESHOLD = 10_000.0
-WARM_THRESHOLD = 5_000.0
-
-
-def title_case(text: str) -> str:
-    return " ".join(w.upper() if w.lower() in ACRONYMS else w.capitalize() for w in text.split())
-
-
-def slugify(text: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-") or "site"
-
-
-def parse_topic(text: str) -> str:
-    match = TOPIC_RE.search(text)
-    if match:
-        return title_case(f"{match.group(1).strip()} {match.group(2)}")
-    if "webinar" in text.lower():
-        return "Webinar"
-    return "Business Launch"
-
-
-def parse_threshold(text: str, low: str) -> float:
-    match = THRESHOLD_RE.search(text)
-    if match:
-        amount = float(match.group(1).replace(",", ""))
-        suffix = (match.group(2) or "").lower()
-        return amount * {"k": 1_000, "m": 1_000_000}.get(suffix, 1)
-    return HIGH_VALUE_THRESHOLD if HIGH_VALUE_RE.search(low) else WARM_THRESHOLD
-
-
-def parse_billing_terms(text: str) -> Dict[str, float]:
-    """Read price + interval only from clauses that talk about billing."""
-    clauses = [c for c in re.split(r"[,;.]|\bthen\b", text, flags=re.IGNORECASE) if BILLING_CLAUSE.search(c.lower())]
-    scope = THRESHOLD_RE.sub(" ", " ".join(clauses) if clauses else text)
-    low = scope.lower()
-    price = DEFAULT_PRICE
-    price_match = PRICE_RE.search(scope)
-    if price_match:
-        price = float((price_match.group(1) or price_match.group(2)).replace(",", ""))
-    interval = 30
-    interval_match = INTERVAL_RE.search(scope)
-    if interval_match:
-        interval = max(1, int(interval_match.group(1)))
-    elif "weekly" in low:
-        interval = 7
-    elif "quarterly" in low:
-        interval = 90
-    elif "yearly" in low or "annual" in low:
-        interval = 365
-    return {"price": price, "interval_days": float(interval)}
-
-
-def money(value: float) -> str:
-    return f"${value:,.0f}"
-
-
-def build_plan(prompt: str, db: Dict[str, Any]) -> ExecutionPlan:
-    text = " ".join(prompt.split())
-    low = text.lower()
-    wants = {name: bool(rx.search(low)) for name, rx in INTENTS.items()}
-    fallback = not any(wants.values())
-    if fallback:
-        wants["crm"] = True
-
-    topic = parse_topic(text)
-    leads: List[Dict[str, Any]] = db.get("leads", [])
-    now = now_utc()
-
-    # --- CRM segmentation -------------------------------------------------- #
-    segment: Optional[SegmentSpec] = None
-    if wants["crm"]:
-        threshold = parse_threshold(text, low)
-        eligible = sorted(
-            (l for l in leads if l["status"] not in EXCLUDED_STATUSES and l["value"] >= threshold),
-            key=lambda l: l["value"],
-            reverse=True,
-        )
-        label = "High-Value Leads" if threshold >= HIGH_VALUE_THRESHOLD else "Warm Leads"
-        segment = SegmentSpec(
-            name=f"{label} (≥ {money(threshold)})",
-            criteria=f"deal value ≥ {money(threshold)} AND status not in {sorted(EXCLUDED_STATUSES)}",
-            threshold=threshold,
-            lead_ids=[l["id"] for l in eligible],
-            lead_count=len(eligible),
-            total_value=float(sum(l["value"] for l in eligible)),
-        )
-
-    # Audience shared by marketing/billing when no explicit segment was requested.
-    if segment:
-        audience_ids = segment.lead_ids
-    else:
-        audience_ids = [l["id"] for l in leads if l["status"] in {"Qualified", "Negotiating"}]
-    audience = len(audience_ids)
-
-    # --- Website ------------------------------------------------------------ #
-    website: Optional[WebsiteSpec] = None
-    if wants["website"]:
-        website = WebsiteSpec(
-            slug=f"{slugify(topic)}-promo",
-            title=f"{topic} | BLACKOUT",
-            headline=f"Join the {topic}",
-            subheadline="Reserve your seat. Limited spots, live Q&A, and an exclusive offer for attendees.",
-            sections=["Hero", "Agenda", "Speakers", "Live Registration Form", "FAQ"],
-        )
-
-    # --- Marketing ----------------------------------------------------------- #
-    campaign: Optional[CampaignSpec] = None
-    if wants["marketing"]:
-        campaign = CampaignSpec(
-            name=f"{topic} Announcement",
-            channel="Email",
-            audience_size=audience,
-            scheduled_for=iso(now + timedelta(days=1), "seconds"),
-        )
-
-    # --- Billing -------------------------------------------------------------- #
-    billing: Optional[BillingSpec] = None
-    if wants["billing"]:
-        terms = parse_billing_terms(text)
-        price, interval = terms["price"], int(terms["interval_days"])
-        billing = BillingSpec(
-            plan_name=f"{topic} VIP {interval}-Day Plan",
-            price=price,
-            interval_days=interval,
-            subscriber_ids=audience_ids,
-            projected_mrr=round(price * audience * 30 / interval, 2),
-        )
-
-    # --- Steps ------------------------------------------------------------------ #
-    steps: List[PlanStep] = []
-
-    def add(module: ModuleName, title: str, detail: str, ms: int, logs: List[str], chips: List[str], gate: bool = False) -> None:
-        steps.append(
-            PlanStep(
-                id=f"step-{len(steps) + 1}",
-                module=module,
-                title=title,
-                detail=detail,
-                duration_ms=ms,
-                requires_approval=gate,
-                logs=logs,
-                chips=chips,
-            )
-        )
-
-    if website:
-        add(
-            "website",
-            "Website Generation",
-            f"Scaffolding responsive promo site for the {topic}.",
-            1900,
-            [
-                f"> init page '{website.slug}' with theme {website.theme}",
-                f"> compose sections: {', '.join(website.sections)}",
-                "> wire registration form to CRM intake",
-            ],
-            [f"/{website.slug}", f"{len(website.sections)} sections", "responsive"],
-        )
-    if segment:
-        add(
-            "crm",
-            "CRM List Segmentation",
-            f"Filtering {len(leads)} CRM records with: {segment.criteria}.",
-            1700,
-            [
-                f"> scan {len(leads)} records",
-                f"> rule: {segment.criteria}",
-                f"> matched {segment.lead_count} leads worth {money(segment.total_value)}",
-            ],
-            [f"{segment.lead_count} leads", money(segment.total_value) + " pipeline"],
-        )
-    if campaign:
-        add(
-            "marketing",
-            "Campaign Scheduling",
-            f"Drafting '{campaign.name}' for {campaign.audience_size} contacts.",
-            1500,
-            [
-                f"> render {campaign.channel.lower()} template",
-                f"> audience resolved: {campaign.audience_size} contacts",
-                f"> schedule send for {campaign.scheduled_for}",
-            ],
-            [campaign.channel, f"{campaign.audience_size} recipients"],
-        )
-    if billing:
-        add(
-            "billing",
-            "Billing Strategy Set",
-            f"Configuring {money(billing.price)} every {billing.interval_days} days for {audience} leads.",
-            1800,
-            [
-                f"> create plan '{billing.plan_name}'",
-                f"> cadence: every {billing.interval_days} days, auto-renew",
-                f"> projected MRR impact: {money(billing.projected_mrr)}",
-            ],
-            [f"{money(billing.price)} / {billing.interval_days}d", f"+{money(billing.projected_mrr)} MRR"],
-        )
-
-    sensitive: List[str] = []
-    if website:
-        sensitive.append(f"Publish '/{website.slug}' to the public web")
-    if campaign:
-        sensitive.append(f"Send '{campaign.name}' to {campaign.audience_size} contacts")
-    if billing:
-        sensitive.append(
-            f"Enroll {audience} leads in recurring billing ({money(billing.price)} every {billing.interval_days} days)"
-        )
-    if segment:
-        sensitive.append(f"Tag {segment.lead_count} CRM records with segment '{segment.name}'")
-    sensitive.append("Persist workflow, requests and analytics to nexus_db.json")
-
-    impact: Dict[str, float] = {
-        "leads_affected": float(len(audience_ids)),
-        "pipeline_value": float(segment.total_value if segment else sum(l["value"] for l in leads if l["id"] in audience_ids)),
-        "projected_mrr": float(billing.projected_mrr if billing else 0),
-    }
-    approval = ApprovalSpec(
-        title="Authorization Required",
-        message="The agent prepared sensitive operations that change live data. Review and authorize before anything is committed.",
-        sensitive_actions=sensitive,
-        impact=impact,
-    )
-    add(
-        "approval",
-        "Approval Gate",
-        "Execution paused. Sensitive operations require explicit human authorization.",
-        900,
-        ["> policy check: destructive/financial actions detected", "> awaiting operator decision"],
-        [f"{len(sensitive)} sensitive actions"],
-        gate=True,
-    )
-
-    modules = [s.module for s in steps if s.module != "approval"]
-    summary = (
-        f"Interpreted as {len(modules)} module action(s): {', '.join(modules)}, then an approval gate."
-        if not fallback
-        else "No explicit module keywords found, so the agent defaulted to CRM lead segmentation, then an approval gate."
-    )
-
-    return ExecutionPlan(
-        plan_id=f"plan-{uuid4().hex[:10]}",
-        prompt=text,
-        summary=summary,
-        steps=steps,
-        entities=Entities(topic=topic, website=website, segment=segment, billing=billing, campaign=campaign),
-        approval=approval,
-        created_at=iso(now),
-    )
-
-
-# --------------------------------------------------------------------------- #
-# Commit logic
-# --------------------------------------------------------------------------- #
-
-
-def unique_slug(db: Dict[str, Any], slug: str) -> str:
-    taken: Set[str] = {w["slug"] for w in db.get("websites", [])}
-    if slug not in taken:
-        return slug
-    n = 2
-    while f"{slug}-{n}" in taken:
-        n += 1
-    return f"{slug}-{n}"
-
-
-def dashboard_payload(db: Dict[str, Any]) -> Dict[str, Any]:
-    plans = db.get("subscription_plans", [])
-    leads = db.get("leads", [])
-    mrr = sum(p["price"] * p["subscribers"] * 30 / max(p["interval_days"], 1) for p in plans)
-    kpis = {
-        "total_leads": len(leads),
-        "pipeline_value": sum(l["value"] for l in leads),
-        "active_subscribers": sum(p["subscribers"] for p in plans),
-        "mrr": round(mrr, 2),
-        "workflows_completed": len(db.get("workflows", [])),
-        "websites_live": len(db.get("websites", [])),
-        "segmented_leads": sum(1 for l in leads if l.get("segment")),
-    }
-    return {**db, "kpis": kpis}
-
-
-# --------------------------------------------------------------------------- #
-# App
-# --------------------------------------------------------------------------- #
-
-app = FastAPI(title="BLACKOUT API", version="1.0.0")
 @app.get("/", response_class=HTMLResponse)
-def read_root():
-    with open("index.html", "r", encoding="utf-8") as f:
-        return f.read()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+def dashboard():
+  with sqlite3.connect(DB_NAME) as conn:
+    cursor = conn.cursor()
+    leads_count = cursor.execute(
+        "SELECT COUNT(*) FROM leads"
+    ).fetchone()[0]
+    campaigns_count = cursor.execute(
+        "SELECT COUNT(*) FROM campaigns"
+    ).fetchone()[0]
+    webinars_count = cursor.execute(
+        "SELECT COUNT(*) FROM webinars"
+    ).fetchone()[0]
+    workflows_count = cursor.execute(
+        "SELECT COUNT(*) FROM workflows WHERE status='Pending Approval'"
+    ).fetchone()[0]
+    settings = dict(cursor.execute("SELECT key, value FROM settings").fetchall())
+
+  html = (
+      BASE_TEMPLATE
+      + """
+    {% block content %}
+    <div class="row mb-4">
+        <div class="col-12">
+            <div class="p-5 mb-4 bg-white rounded-3 shadow-sm border">
+                <h1 class="display-5 fw-bold text-primary">Business Overview</h1>
+                <p class="fs-4 text-muted">{{ slogan }}</p>
+                <hr class="my-4">
+                <p>Welcome to your centralized operations center. Manage leads, review campaigns, schedule webinars, and control AI workflows seamlessly using FastAPI.</p>
+            </div>
+        </div>
+    </div>
+    
+    <div class="row text-center g-4">
+        <div class="col-md-3">
+            <div class="card shadow-sm border-0 py-3">
+                <div class="card-body">
+                    <h5 class="card-title text-muted">Total Leads</h5>
+                    <h2 class="fw-bold text-primary">{{ leads_count }}</h2>
+                    <a href="/crm" class="btn btn-outline-primary btn-sm mt-2">Manage CRM</a>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card shadow-sm border-0 py-3">
+                <div class="card-body">
+                    <h5 class="card-title text-muted">Active Campaigns</h5>
+                    <h2 class="fw-bold text-primary">{{ campaigns_count }}</h2>
+                    <a href="/marketing" class="btn btn-outline-primary btn-sm mt-2">View Campaigns</a>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card shadow-sm border-0 py-3">
+                <div class="card-body">
+                    <h5 class="card-title text-muted">Webinars</h5>
+                    <h2 class="fw-bold text-primary">{{ webinars_count }}</h2>
+                    <a href="/webinars" class="btn btn-outline-primary btn-sm mt-2">Manage Webinars</a>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card shadow-sm border-0 py-3">
+                <div class="card-body">
+                    <h5 class="card-title text-muted">Pending AI Actions</h5>
+                    <h2 class="fw-bold text-warning">{{ workflows_count }}</h2>
+                    <a href="/workflow" class="btn btn-outline-warning btn-sm mt-2">Review Requests</a>
+                </div>
+            </div>
+        </div>
+    </div>
+    {% endblock %}
+    """
+  )
+
+  rendered = Template(html).render(
+      company_name=settings["company_name"],
+      theme_color=settings["theme_color"],
+      slogan=settings["slogan"],
+      leads_count=leads_count,
+      campaigns_count=campaigns_count,
+      webinars_count=webinars_count,
+      workflows_count=workflows_count,
+  )
+  return HTMLResponse(content=rendered)
 
 
-@app.get("/api/health")
-def health() -> Dict[str, str]:
-    return {"status": "ok", "db": str(DB_PATH.name)}
+@app.get("/builder", response_class=HTMLResponse)
+def builder_get():
+  with sqlite3.connect(DB_NAME) as conn:
+    cursor = conn.cursor()
+    settings = dict(cursor.execute("SELECT key, value FROM settings").fetchall())
+
+  html = (
+      BASE_TEMPLATE
+      + """
+    {% block content %}
+    <div class="row">
+        <div class="col-md-5">
+            <div class="card shadow-sm border-0 p-4">
+                <h3 class="mb-3 text-primary">Website Builder</h3>
+                <form method="POST">
+                    <div class="mb-3">
+                        <label class="form-label">Company Name</label>
+                        <input type="text" class="form-control" name="company_name" value="{{ company_name }}" required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Slogan</label>
+                        <input type="text" class="form-control" name="slogan" value="{{ slogan }}" required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Theme Color</label>
+                        <input type="color" class="form-control form-control-color" name="theme_color" value="{{ theme_color }}">
+                    </div>
+                    <button type="submit" class="btn btn-primary w-100">Save & Publish Changes</button>
+                </form>
+            </div>
+        </div>
+        <div class="col-md-7">
+            <div class="card shadow-sm border-0 p-4 bg-white">
+                <h5 class="text-muted mb-3">Live Sample Website Preview</h5>
+                <div class="p-5 border rounded text-center" style="background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);">
+                    <h1 class="fw-bold" style="color: {{ theme_color }};">{{ company_name }}</h1>
+                    <p class="lead text-secondary mt-2">{{ slogan }}</p>
+                    <button class="btn btn-primary mt-3">Get Started Today</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    {% endblock %}
+    """
+  )
+  rendered = Template(html).render(
+      company_name=settings["company_name"],
+      theme_color=settings["theme_color"],
+      slogan=settings["slogan"],
+  )
+  return HTMLResponse(content=rendered)
 
 
-@app.get("/api/dashboard")
-def get_dashboard() -> Dict[str, Any]:
-    with DB_LOCK:
-        return dashboard_payload(read_db())
-
-
-@app.post("/api/agent/parse", response_model=ExecutionPlan)
-def parse_command(body: ParseRequest) -> ExecutionPlan:
-    with DB_LOCK:
-        db = read_db()
-    return build_plan(body.prompt, db)
-
-
-@app.post("/api/agent/approve", response_model=ApproveResponse)
-def approve_plan(body: ApproveRequest) -> ApproveResponse:
-    plan = body.plan
-    with DB_LOCK:
-        db = read_db()
-
-        # Idempotency: approving the same plan twice returns the stored workflow.
-        for wf in db["workflows"]:
-            if wf["plan_id"] == plan.plan_id:
-                return ApproveResponse(
-                    status="already_committed",
-                    workflow_id=wf["id"],
-                    request_id=wf.get("request_id", ""),
-                    committed_at=wf["committed_at"],
-                    summary=wf["effects"],
-                    executed_steps=[ExecutedStep(**s) for s in wf["executed_steps"]],
-                )
-
-        # Validation gate: every referenced lead must exist.
-        known = {l["id"] for l in db["leads"]}
-        referenced: Set[str] = set()
-        if plan.entities.segment:
-            referenced.update(plan.entities.segment.lead_ids)
-        if plan.entities.billing:
-            referenced.update(plan.entities.billing.subscriber_ids)
-        unknown = sorted(referenced - known)
-        if unknown:
-            raise HTTPException(status_code=422, detail=f"Plan references unknown leads: {', '.join(unknown)}")
-        if not plan.steps or not any(s.requires_approval for s in plan.steps):
-            raise HTTPException(status_code=422, detail="Plan is missing its approval gate step")
-
-        committed = now_utc()
-        workflow_id = f"wf-{uuid4().hex[:8]}"
-        request_id = f"req-{uuid4().hex[:8]}"
-
-        # Executed steps with sequential timestamps ending at commit time.
-        cursor = committed - timedelta(milliseconds=sum(s.duration_ms for s in plan.steps))
-        executed: List[ExecutedStep] = []
-        for step in plan.steps:
-            started = cursor
-            cursor = cursor + timedelta(milliseconds=step.duration_ms)
-            executed.append(
-                ExecutedStep(**step.model_dump(), started_at=iso(started, "milliseconds"), completed_at=iso(cursor, "milliseconds"))
-            )
-
-        ent = plan.entities
-        effects: Dict[str, Any] = {
-            "website_slug": None,
-            "leads_segmented": 0,
-            "subscribers_added": 0,
-            "projected_mrr_added": 0.0,
-            "engagement_added": 0,
-            "plan_name": None,
-            "workflow_id": workflow_id,
-        }
-
-        if ent.website:
-            slug = unique_slug(db, ent.website.slug)
-            db["websites"].append(
-                {
-                    **ent.website.model_dump(),
-                    "id": f"site-{uuid4().hex[:8]}",
-                    "slug": slug,
-                    "status": "published",
-                    "workflow_id": workflow_id,
-                    "created_at": iso(committed),
-                }
-            )
-            effects["website_slug"] = slug
-            effects["engagement_added"] += 120  # expected launch-day visits
-
-        segment_name = ent.segment.name if ent.segment else None
-        tagged_ids: Set[str] = set(ent.segment.lead_ids) if ent.segment else set()
-        enrolled_ids: Set[str] = set(ent.billing.subscriber_ids) if ent.billing else set()
-        for lead in db["leads"]:
-            if lead["id"] in tagged_ids:
-                lead["segment"] = segment_name
-            if lead["id"] in enrolled_ids:
-                lead["status"] = "Offer Sent"
-        effects["leads_segmented"] = len(tagged_ids)
-
-        if ent.campaign:
-            effects["engagement_added"] += int(round(ent.campaign.audience_size * 0.42 * 10))
-
-        if ent.billing:
-            bill = ent.billing
-            db["subscription_plans"].append(
-                {
-                    "id": f"plan-{uuid4().hex[:6]}",
-                    "name": bill.plan_name,
-                    "price": bill.price,
-                    "currency": bill.currency,
-                    "interval_days": bill.interval_days,
-                    "features": ["Recurring auto-billing", f"Created by AI workflow {workflow_id}"],
-                    "subscribers": len(enrolled_ids),
-                    "subscriber_ids": sorted(enrolled_ids),
-                    "status": "active",
-                    "created_at": iso(committed),
-                }
-            )
-            effects["subscribers_added"] = len(enrolled_ids)
-            effects["projected_mrr_added"] = bill.projected_mrr
-            effects["plan_name"] = bill.plan_name
-
-        # Analytics: append a new live data point derived from the previous one.
-        timeline: List[Dict[str, Any]] = db["analytics"]["timeline"]
-        last = timeline[-1] if timeline else {"subscriptions": 0, "engagement": 0}
-        timeline.append(
-            {
-                "label": f"W{len(timeline) + 1}",
-                "subscriptions": last["subscriptions"] + effects["subscribers_added"],
-                "engagement": last["engagement"] + effects["engagement_added"],
-            }
-        )
-
-        modules = [s.module for s in plan.steps if s.module != "approval"]
-        db["ai_requests"].append(
-            {
-                "id": request_id,
-                "prompt": body.prompt,
-                "plan_id": plan.plan_id,
-                "summary": plan.summary,
-                "modules": modules,
-                "status": "approved",
-                "created_at": iso(committed),
-            }
-        )
-        db["workflows"].append(
-            {
-                "id": workflow_id,
-                "request_id": request_id,
-                "plan_id": plan.plan_id,
-                "prompt": body.prompt,
-                "status": "completed",
-                "approved_by": body.approved_by,
-                "executed_steps": [s.model_dump() for s in executed],
-                "effects": effects,
-                "created_at": plan.created_at,
-                "committed_at": iso(committed),
-            }
-        )
-
-        write_db(db)
-
-    return ApproveResponse(
-        status="committed",
-        workflow_id=workflow_id,
-        request_id=request_id,
-        committed_at=iso(committed),
-        summary=effects,
-        executed_steps=executed,
+@app.post("/builder", response_class=HTMLResponse)
+def builder_post(
+    company_name: str = Form(...),
+    slogan: str = Form(...),
+    theme_color: str = Form(...),
+):
+  with sqlite3.connect(DB_NAME) as conn:
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE settings SET value = ? WHERE key = 'company_name'",
+        (company_name,),
     )
+    cursor.execute(
+        "UPDATE settings SET value = ? WHERE key = 'theme_color'",
+        (theme_color,),
+    )
+    cursor.execute("UPDATE settings SET value = ? WHERE key = 'slogan'", (slogan,))
+    conn.commit()
+  return RedirectResponse(url="/builder", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.get("/crm", response_class=HTMLResponse)
+def crm_get():
+  with sqlite3.connect(DB_NAME) as conn:
+    cursor = conn.cursor()
+    leads = cursor.execute("SELECT id, name, email, status FROM leads").fetchall()
+    settings = dict(cursor.execute("SELECT key, value FROM settings").fetchall())
+
+  html = (
+      BASE_TEMPLATE
+      + """
+    {% block content %}
+    <div class="row">
+        <div class="col-md-4">
+            <div class="card shadow-sm border-0 p-4">
+                <h4 class="mb-3 text-primary">Add New Lead</h4>
+                <form method="POST">
+                    <div class="mb-3">
+                        <label class="form-label">Full Name</label>
+                        <input type="text" class="form-control" name="name" required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Email Address</label>
+                        <input type="email" class="form-control" name="email" required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Lead Status</label>
+                        <select class="form-select" name="status">
+                            <option value="New">New</option>
+                            <option value="Contacted">Contacted</option>
+                            <option value="Converted">Converted</option>
+                        </select>
+                    </div>
+                    <button type="submit" class="btn btn-primary w-100">Add Lead</button>
+                </form>
+            </div>
+        </div>
+        <div class="col-md-8">
+            <div class="card shadow-sm border-0 p-4">
+                <h4 class="mb-3 text-primary">Customer Leads Database</h4>
+                <table class="table table-hover align-middle">
+                    <thead class="table-light">
+                        <tr>
+                            <th>ID</th>
+                            <th>Name</th>
+                            <th>Email</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for lead in leads %}
+                        <tr>
+                            <td>{{ lead[0] }}</td>
+                            <td>{{ lead[1] }}</td>
+                            <td>{{ lead[2] }}</td>
+                            <td><span class="badge bg-secondary">{{ lead[3] }}</span></td>
+                        </tr>
+                        {% else %}
+                        <tr><td colspan="4" class="text-center text-muted">No leads found in database.</td></tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    {% endblock %}
+    """
+  )
+  rendered = Template(html).render(
+      company_name=settings["company_name"],
+      theme_color=settings["theme_color"],
+      leads=leads,
+  )
+  return HTMLResponse(content=rendered)
+
+
+@app.post("/crm", response_class=HTMLResponse)
+def crm_post(
+    name: str = Form(...), email: str = Form(...), status: str = Form(...)
+):
+  with sqlite3.connect(DB_NAME) as conn:
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO leads (name, email, status) VALUES (?, ?, ?)",
+        (name, email, status),
+    )
+    conn.commit()
+  return RedirectResponse(url="/crm", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.get("/marketing", response_class=HTMLResponse)
+def marketing_get():
+  with sqlite3.connect(DB_NAME) as conn:
+    cursor = conn.cursor()
+    campaigns = cursor.execute(
+        "SELECT id, title, channel, budget, status FROM campaigns"
+    ).fetchall()
+    settings = dict(cursor.execute("SELECT key, value FROM settings").fetchall())
+
+  html = (
+      BASE_TEMPLATE
+      + """
+    {% block content %}
+    <div class="row">
+        <div class="col-md-4">
+            <div class="card shadow-sm border-0 p-4">
+                <h4 class="mb-3 text-primary">Create Campaign</h4>
+                <form method="POST">
+                    <div class="mb-3">
+                        <label class="form-label">Campaign Title</label>
+                        <input type="text" class="form-control" name="title" required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Channel</label>
+                        <input type="text" class="form-control" name="channel" placeholder="e.g. Google Ads, Meta" required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Budget ($)</label>
+                        <input type="number" step="0.01" class="form-control" name="budget" required>
+                    </div>
+                    <button type="submit" class="btn btn-primary w-100">Launch Campaign</button>
+                </form>
+            </div>
+        </div>
+        <div class="col-md-8">
+            <div class="card shadow-sm border-0 p-4">
+                <h4 class="mb-3 text-primary">Active Marketing Campaigns</h4>
+                <table class="table table-hover align-middle">
+                    <thead class="table-light">
+                        <tr>
+                            <th>ID</th>
+                            <th>Title</th>
+                            <th>Channel</th>
+                            <th>Budget</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for camp in campaigns %}
+                        <tr>
+                            <td>{{ camp[0] }}</td>
+                            <td>{{ camp[1] }}</td>
+                            <td>{{ camp[2] }}</td>
+                            <td>${{ "%.2f"|format(camp[3]) }}</td>
+                            <td><span class="badge bg-success">{{ camp[4] }}</span></td>
+                        </tr>
+                        {% else %}
+                        <tr><td colspan="5" class="text-center text-muted">No campaigns created yet.</td></tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    {% endblock %}
+    """
+  )
+  rendered = Template(html).render(
+      company_name=settings["company_name"],
+      theme_color=settings["theme_color"],
+      campaigns=campaigns,
+  )
+  return HTMLResponse(content=rendered)
+
+
+@app.post("/marketing", response_class=HTMLResponse)
+def marketing_post(
+    title: str = Form(...), channel: str = Form(...), budget: float = Form(...)
+):
+  with sqlite3.connect(DB_NAME) as conn:
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO campaigns (title, channel, budget) VALUES (?, ?, ?)",
+        (title, channel, budget),
+    )
+    conn.commit()
+  return RedirectResponse(url="/marketing", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.get("/webinars", response_class=HTMLResponse)
+def webinars_get():
+  with sqlite3.connect(DB_NAME) as conn:
+    cursor = conn.cursor()
+    webinars_list = cursor.execute(
+        "SELECT id, title, speaker, date FROM webinars"
+    ).fetchall()
+    settings = dict(cursor.execute("SELECT key, value FROM settings").fetchall())
+
+  html = (
+      BASE_TEMPLATE
+      + """
+    {% block content %}
+    <div class="row">
+        <div class="col-md-4">
+            <div class="card shadow-sm border-0 p-4">
+                <h4 class="mb-3 text-primary">Schedule Webinar</h4>
+                <form method="POST">
+                    <div class="mb-3">
+                        <label class="form-label">Webinar Title</label>
+                        <input type="text" class="form-control" name="title" required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Speaker</label>
+                        <input type="text" class="form-control" name="speaker" required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Date & Time</label>
+                        <input type="datetime-local" class="form-control" name="date" required>
+                    </div>
+                    <button type="submit" class="btn btn-primary w-100">Schedule Event</button>
+                </form>
+            </div>
+        </div>
+        <div class="col-md-8">
+            <div class="card shadow-sm border-0 p-4">
+                <h4 class="mb-3 text-primary">Scheduled Webinars</h4>
+                <table class="table table-hover align-middle">
+                    <thead class="table-light">
+                        <tr>
+                            <th>ID</th>
+                            <th>Title</th>
+                            <th>Speaker</th>
+                            <th>Date</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for web in webinars_list %}
+                        <tr>
+                            <td>{{ web[0] }}</td>
+                            <td>{{ web[1] }}</td>
+                            <td>{{ web[2] }}</td>
+                            <td>{{ web[3] }}</td>
+                        </tr>
+                        {% else %}
+                        <tr><td colspan="4" class="text-center text-muted">No webinars scheduled.</td></tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    {% endblock %}
+    """
+  )
+  rendered = Template(html).render(
+      company_name=settings["company_name"],
+      theme_color=settings["theme_color"],
+      webinars_list=webinars_list,
+  )
+  return HTMLResponse(content=rendered)
+
+
+@app.post("/webinars", response_class=HTMLResponse)
+def webinars_post(
+    title: str = Form(...), speaker: str = Form(...), date: str = Form(...)
+):
+  with sqlite3.connect(DB_NAME) as conn:
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO webinars (title, speaker, date) VALUES (?, ?, ?)",
+        (title, speaker, date),
+    )
+    conn.commit()
+  return RedirectResponse(url="/webinars", status_code=status.HTTP_303_SEE_OTHER)
+
+
+@app.get("/subscriptions", response_class=HTMLResponse)
+def subscriptions_get(subscribers: int = 120, price: float = 29.0, churn: float = 5.0):
+  mrr = subscribers * price
+  arr = mrr * 12
+
+  with sqlite3.connect(DB_NAME) as conn:
+    cursor = conn.cursor()
+    settings = dict(cursor.execute("SELECT key, value FROM settings").fetchall())
+
+  html = (
+      BASE_TEMPLATE
+      + """
+    {% block content %}
+    <div class="row">
+        <div class="col-md-5">
+            <div class="card shadow-sm border-0 p-4">
+                <h4 class="mb-3 text-primary">Subscription Revenue Calculator</h4>
+                <form method="POST">
+                    <div class="mb-3">
+                        <label class="form-label">Active Subscribers</label>
+                        <input type="number" class="form-control" name="subscribers" value="{{ subscribers }}" required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Monthly Price per User ($)</label>
+                        <input type="number" step="0.01" class="form-control" name="price" value="{{ price }}" required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Estimated Monthly Churn Rate (%)</label>
+                        <input type="number" step="0.1" class="form-control" name="churn" value="{{ churn }}" required>
+                    </div>
+                    <button type="submit" class="btn btn-primary w-100">Calculate Revenue</button>
+                </form>
+            </div>
+        </div>
+        <div class="col-md-7">
+            <div class="card shadow-sm border-0 p-4 bg-white">
+                <h4 class="mb-3 text-primary">Revenue Metrics Overview</h4>
+                <hr>
+                <div class="row text-center">
+                    <div class="col-6 mb-4">
+                        <h6 class="text-muted">Monthly Recurring Revenue (MRR)</h6>
+                        <h2 class="text-success fw-bold">${{ "%.2f"|format(mrr) }}</h2>
+                    </div>
+                    <div class="col-6 mb-4">
+                        <h6 class="text-muted">Annual Recurring Revenue (ARR)</h6>
+                        <h2 class="text-primary fw-bold">${{ "%.2f"|format(arr) }}</h2>
+                    </div>
+                    <div class="col-12">
+                        <div class="alert alert-info py-2">
+                            Estimated churn impact: ~{{ churn }}% monthly subscriber loss.
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    {% endblock %}
+    """
+  )
+  rendered = Template(html).render(
+      company_name=settings["company_name"],
+      theme_color=settings["theme_color"],
+      subscribers=subscribers,
+      price=price,
+      churn=churn,
+      mrr=mrr,
+      arr=arr,
+  )
+  return HTMLResponse(content=rendered)
+
+
+@app.post("/subscriptions", response_class=HTMLResponse)
+def subscriptions_post(
+    subscribers: int = Form(...), price: float = Form(...), churn: float = Form(...)
+):
+  # Redirect back with query parameters to retain values
+  return RedirectResponse(
+      url=f"/subscriptions?subscribers={subscribers}&price={price}&churn={churn}",
+      status_code=status.HTTP_303_SEE_OTHER,
+  )
+
+
+@app.get("/workflow", response_class=HTMLResponse)
+def workflow_get():
+  with sqlite3.connect(DB_NAME) as conn:
+    cursor = conn.cursor()
+    workflows = cursor.execute(
+        "SELECT id, instruction, status FROM workflows"
+    ).fetchall()
+    settings = dict(cursor.execute("SELECT key, value FROM settings").fetchall())
+
+  html = (
+      BASE_TEMPLATE
+      + """
+    {% block content %}
+    <div class="row">
+        <div class="col-md-5">
+            <div class="card shadow-sm border-0 p-4">
+                <h4 class="mb-3 text-primary">AI Workflow Assistant</h4>
+                <p class="text-muted small">Instruct the AI to execute simulated actions across your business modules.</p>
+                <form method="POST">
+                    <input type="hidden" name="action" value="add">
+                    <div class="mb-3">
+                        <label class="form-label">Workflow Instruction</label>
+                        <textarea class="form-control" name="instruction" rows="3" placeholder="Enter business action instruction..." required></textarea>
+                    </div>
+                    <button type="submit" class="btn btn-primary w-100">Request AI Action</button>
+                </form>
+            </div>
+        </div>
+        <div class="col-md-7">
+            <div class="card shadow-sm border-0 p-4">
+                <h4 class="mb-3 text-primary">Workflow Approval Queue</h4>
+                <table class="table table-hover align-middle">
+                    <thead class="table-light">
+                        <tr>
+                            <th>ID</th>
+                            <th>Instruction</th>
+                            <th>Status</th>
+                            <th>Action</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for wf in workflows %}
+                        <tr>
+                            <td>{{ wf[0] }}</td>
+                            <td>{{ wf[1] }}</td>
+                            <td>
+                                {% if wf[2] == 'Pending Approval' %}
+                                <span class="badge bg-warning text-dark">{{ wf[2] }}</span>
+                                {% elif wf[2] == 'Approved & Executed' %}
+                                <span class="badge bg-success">{{ wf[2] }}</span>
+                                {% else %}
+                                <span class="badge bg-danger">{{ wf[2] }}</span>
+                                {% endif %}
+                            </td>
+                            <td>
+                                {% if wf[2] == 'Pending Approval' %}
+                                <form method="POST" class="d-inline">
+                                    <input type="hidden" name="action" value="approve">
+                                    <input type="hidden" name="id" value="{{ wf[0] }}">
+                                    <button type="submit" class="btn btn-success btn-sm">Approve</button>
+                                </form>
+                                <form method="POST" class="d-inline">
+                                    <input type="hidden" name="action" value="reject">
+                                    <input type="hidden" name="id" value="{{ wf[0] }}">
+                                    <button type="submit" class="btn btn-outline-danger btn-sm">Reject</button>
+                                </form>
+                                {% else %}
+                                <span class="text-muted small">Completed</span>
+                                {% endif %}
+                            </td>
+                        </tr>
+                        {% else %}
+                        <tr><td colspan="4" class="text-center text-muted">No workflows queued.</td></tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    {% endblock %}
+    """
+  )
+  rendered = Template(html).render(
+      company_name=settings["company_name"],
+      theme_color=settings["theme_color"],
+      workflows=workflows,
+  )
+  return HTMLResponse(content=rendered)
+
+
+@app.post("/workflow", response_class=HTMLResponse)
+def workflow_post(
+    action: str = Form(...),
+    instruction: str = Form(None),
+    id: int = Form(None),
+):
+  with sqlite3.connect(DB_NAME) as conn:
+    cursor = conn.cursor()
+    if action == "add" and instruction:
+      cursor.execute(
+          "INSERT INTO workflows (instruction, status) VALUES (?, 'Pending"
+          " Approval')",
+          (instruction,),
+      )
+    elif action == "approve" and id is not None:
+      cursor.execute(
+          "UPDATE workflows SET status = 'Approved & Executed' WHERE id = ?",
+          (id,),
+      )
+    elif action == "reject" and id is not None:
+      cursor.execute("UPDATE workflows SET status = 'Rejected' WHERE id = ?", (id,))
+    conn.commit()
+  return RedirectResponse(url="/workflow", status_code=status.HTTP_303_SEE_OTHER)
+
+
+if __name__ == "__main__":
+  init_db()
+  uvicorn.run("main:app", host="127.0.0.1", port=5000, reload=True)
